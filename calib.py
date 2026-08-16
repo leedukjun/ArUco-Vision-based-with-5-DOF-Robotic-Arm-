@@ -1,14 +1,8 @@
-import tkinter as tk
-import serial
-import time
+import tkinter as tk, serial
 
-arduino = serial.Serial('COM3', 9600)
-time.sleep(2)
-
-
-def send_angle(val):
-    arduino.write(f"{val}\n".encode())
+# Nhớ đổi 'COM3' thành cổng thực tế trên máy bạn
+s = serial.Serial('COM7', 115200) 
 
 root = tk.Tk()
-tk.Scale(root, from_=0, to=180, orient='horizontal', length=300, command=send_angle).pack(pady=20)
+tk.Scale(root, from_=500, to=2500, orient='horizontal', length=300, command=lambda v: s.write((v + '\n').encode())).pack()
 root.mainloop()
