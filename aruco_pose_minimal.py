@@ -14,9 +14,22 @@ import numpy as np
 
 # ---------------------------------------------------------------- settings
 CALIB = "calibration.npz"
-MARKER = 50.0                       # mm, printed black square edge
 ORIGIN, ARM = 0, 1
 ARUCO_DICT = cv2.aruco.DICT_4X4_50
+
+# Printed black square edge in mm, EXCLUDING the white border around it.
+#
+# Every distance this script reports scales linearly with this number, so it is
+# the first thing to check if the readings are all off by a constant
+# percentage. Printers rarely output at 100%: "fit to page" typically shrinks
+# artwork by 6-9%, which shows up here as distances reading that much too far.
+#
+# To correct it, measure the black square with a ruler, or divide:
+#     MARKER_true = 50.0 * (distance you measure) / (distance shown)
+# Run "python aruco_pose_minimal.py 45.5" to try a value without editing this.
+MARKER = 50.0
+if len(sys.argv) > 1:
+    MARKER = float(sys.argv[1])
 
 # ------------------------------------------------------------- calibration
 _c = np.load(CALIB)
@@ -79,8 +92,20 @@ if not cap.isOpened():
     sys.exit("Could not open the camera.")
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, CW)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CH)
-print("calibrated at %dx%d, fx=%.1f -- keep markers within ~%.0f mm"
-      % (CW, CH, K[0, 0], MARKER * K[0, 0] / 110.0))
+
+# Confirm the camera actually gave us the calibrated resolution. Webcams often
+# ignore the request, and running at another size makes every distance wrong.
+_ok, _probe = cap.read()
+if not _ok:
+    sys.exit("Camera opened but delivered no frames.")
+AH, AW = _probe.shape[:2]
+print("marker %.1f mm | calibrated %dx%d | actually capturing %dx%d"
+      % (MARKER, CW, CH, AW, AH))
+if (AW, AH) != (CW, CH):
+    print("  ** MISMATCH: distances will be wrong. Recalibrate at %dx%d,"
+          " or force the camera to %dx%d. **" % (AW, AH, CW, CH))
+print("keep markers within ~%.0f mm of the camera for best accuracy"
+      % (MARKER * K[0, 0] / 110.0))
 
 font = cv2.FONT_HERSHEY_SIMPLEX
 dropped = 0
@@ -121,12 +146,12 @@ while True:
             T[:3, :3] = R0.T @ T1[:3, :3]
             T[:3, 3] = R0.T @ (T1[:3, 3] - T0[:3, 3])
 
-            x, y, z = T[:3, 3]
+            x, y = T[0, 3], T[1, 3]      # Z dropped: both markers lie on the table
             roll, pitch, yaw = euler_zyx(T[:3, :3])
 
-            print("X %8.1f  Y %8.1f  Z %8.1f mm   |   R %7.1f  P %7.1f  Y %7.1f deg"
-                  % (x, y, z, roll, pitch, yaw))
-            cv2.putText(frame, "X %.1f  Y %.1f  Z %.1f mm" % (x, y, z),
+            print("X %8.1f  Y %8.1f mm   |   R %7.1f  P %7.1f  Y %7.1f deg"
+                  % (x, y, roll, pitch, yaw))
+            cv2.putText(frame, "X %.1f  Y %.1f mm" % (x, y),
                         (10, 25), font, 0.6, (0, 255, 0), 2)
             cv2.putText(frame, "R %.1f  P %.1f  Y %.1f deg" % (roll, pitch, yaw),
                         (10, 50), font, 0.6, (0, 255, 255), 2)
