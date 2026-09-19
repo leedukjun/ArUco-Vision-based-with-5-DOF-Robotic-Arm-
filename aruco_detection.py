@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Integrated Vision-to-Motion Pipeline:
-ArUco Workspace Tracking + Foreground Object Detection + 4-DoF Robot Inverse Kinematics (IK).
+Integrated Vision-to-Motion Pipeline with Hardware Serial Interface:
+ArUco Workspace Tracking + Object Detection + 4-DoF IK + Serial PWM (PCA9685).
 
 Controls:
     'b' : Capture median background reference (ensure mat is clear).
-    'o' : Compute target 3D base pose and solve 4-DoF Inverse Kinematics.
+    'o' : Compute target 3D base pose, solve 4-DoF IK, and transmit PWM to Arduino.
     'q' : Terminate pipeline.
 """
 
@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import time
 import cv2
 import numpy as np
+import serial  # Requires: pip install pyserial
 
 
 # =============================================================================
@@ -31,12 +32,69 @@ class Config:
     robot_offset_xyz: tuple = (-0.20, 0.15, 0.08)  # [X, Y, Z] offset in meters
     dh_lengths: tuple = (0.30, 0.35, 0.25, 0.10)   # [L0, L1, L2, L_grip] in meters
 
+    # Hardware Serial & Servo Calibration
+    serial_port: str = "COM3"
+    baud_rate: int = 115200
+    # Servo Calibration format: (Home_Offset_Deg, Direction_Sign)
+    # Physical Servo: 0 deg = 500 us, 90 deg (Home) = 1500 us, 180 deg = 2500 us
+    servo_calib: tuple = (
+        (90.0,  1.0),   # Joint 1: Base Yaw      (90 deg center, +1 normal)
+        (90.0, -1.0),   # Joint 2: Shoulder Pitch(90 deg vertical, -1 inverted)
+        (90.0,  1.0),   # Joint 3: Elbow Pitch   (90 deg elbow, +1 normal)
+        (90.0,  1.0)    # Joint 4: Gripper Roll  (90 deg neutral, +1 normal)
+    )
+
     # Vision & Segmentation Tuning
     border_pad_px: int = 10
     min_thickness_px: int = 12
     max_area_fraction: float = 0.50
     smoothing_factor: float = 0.05
     bg_frames_count: int = 15
+
+
+# =============================================================================
+# SERIAL CONTROLLER (PYTHON -> ARDUINO)
+# =============================================================================
+class RobotSerialController:
+    """Manages serial communication with Arduino for PCA9685 PWM transmission."""
+
+    def __init__(self, port: str, baud: int):
+        self.ser = None
+        try:
+            self.ser = serial.Serial(port, baud, timeout=1)
+            time.sleep(2.0)  # Wait for Arduino auto-reset
+            print(f"[SERIAL] Successfully opened {port} at {baud} baud.")
+        except Exception as e:
+            print(f"[WARNING] Serial connection to {port} failed ({e}). Running in simulation mode.")
+
+    def send_pwm(self, pwm_list: list[int]):
+        """Transmits packet format: '<pwm0,pwm1,pwm2,pwm3>\\n'"""
+        if self.ser and self.ser.is_open:
+            packet = f"<{','.join(map(str, pwm_list))}>\n"
+            self.ser.write(packet.encode("utf-8"))
+            print(f"[SERIAL TX] Packet sent: {packet.strip()}")
+        else:
+            print(f"[SIMULATION TX] Packet: <{','.join(map(str, pwm_list))}>")
+
+    def close(self):
+        if self.ser and self.ser.is_open:
+            self.ser.close()
+            print("[SERIAL] Port closed.")
+
+
+def angles_to_pwm(q_rad_list: np.ndarray, calib_table: tuple) -> list[int]:
+    """Converts D-H joint angles (radians) to hardware PWM pulse widths (500 - 2500 us)."""
+    pwm_values = []
+    for q_rad, (offset_deg, direction) in zip(q_rad_list, calib_table):
+        q_deg = np.rad2deg(q_rad)
+        # Apply calibration formula: Servo_Angle = Offset + (Direction * q)
+        servo_deg = offset_deg + (direction * q_deg)
+        # Clamp safely within physical hardware limits (0 - 180 degrees)
+        servo_deg = max(0.0, min(180.0, servo_deg))
+        # Map degrees to microsecond pulse width: 0 deg = 500 us, 180 deg = 2500 us
+        pwm_us = int(500 + (servo_deg / 180.0) * 2000)
+        pwm_values.append(pwm_us)
+    return pwm_values
 
 
 # =============================================================================
@@ -88,7 +146,6 @@ class Kinematics4DoF:
             if np.linalg.norm(err) <= tol:
                 return q, True
 
-            # Extract joint frame origins & Z-axes for geometric Jacobian
             origins = [np.zeros(3)] + [t[:3, 3] for t in chain[:-1]]
             z_axes  = [np.array([0, 0, 1])] + [t[:3, 2] for t in chain[:-1]]
 
@@ -228,6 +285,7 @@ def main():
     cfg = Config()
     transformer = WorkspaceTransformer(cfg)
     detector = ObjectDetector(cfg)
+    serial_ctrl = RobotSerialController(cfg.serial_port, cfg.baud_rate)
 
     # Initialize Video Capture & Camera Matrix Remapping
     cap = cv2.VideoCapture(0)
@@ -250,7 +308,7 @@ def main():
 
     print("\n--- Command Keys ---")
     print(" [b] Capture background reference (remove objects from field)")
-    print(" [o] Solve Inverse Kinematics for tracked object")
+    print(" [o] Solve Inverse Kinematics & Transmit PWM to Arduino")
     print(" [q] Exit application\n")
 
     latest_target = None
@@ -313,9 +371,9 @@ def main():
                 cfg.robot_offset_xyz[2]
             ])
 
-            print("-" * 60)
-            print(f"[TARGET] Image Feature  : u={u} px, v={v} px")
-            print(f"[TARGET] Cartesian Pos  : X={target_xyz[0]:.4f}m, Y={target_xyz[1]:.4f}m, Z={target_xyz[2]:.4f}m")
+            print("-" * 65)
+            print(f"[TARGET] Pixel Coordinate : u={u} px, v={v} px")
+            print(f"[TARGET] Cartesian Pos (m): X={target_xyz[0]:.4f}, Y={target_xyz[1]:.4f}, Z={target_xyz[2]:.4f}")
 
             # Execute Numerical IK Solver
             q_sol, converged = Kinematics4DoF.solve_ik(target_xyz, cfg.dh_lengths)
@@ -324,12 +382,20 @@ def main():
                 joint_names = ["Base Yaw", "Shoulder Pitch", "Elbow Pitch", "Gripper Roll"]
                 for i, (name, val) in enumerate(zip(joint_names, q_sol)):
                     print(f"  Joint {i+1} ({name:<14}): {np.rad2deg(val):+7.2f} deg  ({val:+.4f} rad)")
+
+                # Convert Joint Angles -> Calibrated Servo PWM (microseconds)
+                pwm_packet = angles_to_pwm(q_sol, cfg.servo_calib)
+                print(f"[SERVO PWM] Transmitting Pulse Widths: {pwm_packet} us")
+
+                # Transmit over Serial to Arduino -> PCA9685
+                serial_ctrl.send_pwm(pwm_packet)
             else:
                 print("[IK SOLVER] Error: Pose unreachable or solver stalled.")
-            print("-" * 60)
+            print("-" * 65)
 
     cap.release()
     cv2.destroyAllWindows()
+    serial_ctrl.close()
 
 
 if __name__ == "__main__":
